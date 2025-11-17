@@ -7,7 +7,6 @@ from network import Network, Node, Road, Lane
 from car_agent import CarAgent
 from trafficLight_agent import TrafficLightAgent
 
-
 async def simulation():
     # -------------------------------------------------------
     # 1. Load your network
@@ -28,7 +27,7 @@ async def simulation():
             jid=tl_jid,
             password=tl_pwd,
             road_id=road_id,
-            network=network 
+            network=network,
         )
 
         await tl_agent.start()
@@ -41,6 +40,9 @@ async def simulation():
     # 2. Choose a traffic light for each intersection to have green light from start
     # ------------------------------------------------------------------------------------------
     for intersection, tl_group in traffic_light_groups.items():
+        if len(tl_group) == 1:
+            tl_group[0].signal = "green"
+            continue
         chosen_tl = random.choice(tl_group)
         chosen_tl.add_behaviour(chosen_tl.SignalTimeBehaviour())
 
@@ -50,30 +52,32 @@ async def simulation():
     car_counter = 0
 
     print("\n[SIM] Starting main loop… Cars spawn every 0.5 seconds.\n")
+    active_cars = set()
 
     while True:
-        if car_counter == 0:
-            temp = list(network.spawn_nodes)
-            starting_node = random.choice(temp)
-            starting_road = starting_node.outRoads[0].ID
-            temp.remove(starting_node)
-            end_node = random.choice(temp).ID
+        temp = list(network.spawn_nodes)
+        starting_node = random.choice(temp)
+        starting_road = starting_node.outRoads[0].ID
+        temp.remove(starting_node)
+        end_node = random.choice(temp).ID
 
-            car_jid = f"rivenisbadchamp{car_counter}@localhost"
-            car_pwd = "car"
+        car_jid = f"rivenisbadchamp{car_counter}@localhost"
+        car_pwd = "car"
 
-            print(f"[SIM] Spawning {car_jid} at road {starting_road} → node {end_node}")
+        print(f"[SIM] Spawning {car_jid} at road {starting_road} → node {end_node}")
 
-            car_agent = CarAgent(
-                jid=car_jid,
-                password=car_pwd,
-                starting_road=starting_road,
-                end_node=end_node
-            )
+        car_agent = CarAgent(
+            jid=car_jid,
+            password=car_pwd,
+            starting_road=starting_road,
+            end_node=end_node,
+            remove_callback=lambda jid=car_jid: active_cars.remove(jid)
+        )
+        active_cars.add(car_agent)
 
-            await car_agent.start()
+        await car_agent.start()
 
-            car_counter += 1
+        car_counter += 1
 
         await asyncio.sleep(0.5)  # spawn interval
 
