@@ -1,191 +1,271 @@
 from spade.agent import Agent
-from spade.behaviour import PeriodicBehaviour, OneShotBehaviour
+from spade.behaviour import PeriodicBehaviour, OneShotBehaviour, CyclicBehaviour
 from spade.template import Template
 from spade.message import Message
+
 from collections import deque
 import json
+import asyncio
 
 class CarAgent(Agent):
-    def __init__(self, jid, password, start_node, end_node):
+    def __init__(self, jid, password, starting_road, end_node, remove_callback=None):
         super().__init__(jid, password)
-        self.start_node = start_node
+        self.starting_road = starting_road
+        self.starting_lane = 0
         self.end_node = end_node
-        self.routing_agent_JID = "routingAgent@localhost"
+        self.remove_callback = remove_callback
+        self.fuel_consumption = {"moving": 1,"idle": 0.2}
+        self.travel_weight = 0.5
+        self.capacity_weight = 0.5
         
         # dynamic state
-        self.max_fuel = 50
-        self.fuel = self.max_fuel
-        self.fuel_consumption = self.fuel_consumption
-        self.route = None
-        self.possibleRoutes = None
-        self.current_road = None
-        self.current_lane = None
-        self.next_road = None
-        self.next_lane = None
-        self.current_tl_jid = None
+        self.wasted_fuel = 0
+        self.current_road = self.starting_road
+        self.current_lane = self.starting_lane
+        self.current_tl_jid = f"tl{self.current_road}@localhost"
         self.current_tl_signal = None
-        self.total_lane_capacity = None
         self.current_lane_capacity = None
-        self.position = None
-        self.canStillMoveTo = None
+        self.total_lane_capacity = None
+
+        self.position = 1
+        self.can_still_move_to = None
+
+        self.possible_routes = None
+        self.n_received_capacities = 0
+        self.received_capacities = {}
 
     async def setup(self):
-        #print(f"[{self.jid}] Car starting...")
+        print(f"[{self.jid}] Car starting...")
+        self.add_behaviour(self.ReceiveMessageBehaviour())
 
-        # first, request initial route
-        spawn_bh = self.SpawnCar()
-        self.add_behaviour(spawn_bh)
-        await spawn_bh.join()
-
-        # start the unified controller
-        self.add_behaviour(self.DriveController(period=0.1))
+        self.add_behaviour(self.SpawnCar())
 
     class SpawnCar(OneShotBehaviour):
-        """Car requests a route from its routing agent based on its starting and ending node."""
+        """Set initial attributes for car"""
         async def run(self):
-            msg = Message(to=self.agent.routing_agent_JID)
-            msg.set_metadata("type", "request_spawnNewRoute")
-            msg.body = f"{self.agent.start_node} {self.agent.end_node}"
-            await self.send(msg)
-            
-            response = await self.receive(timeout=5)
-            if not response:
-                print(f"[{self.agent.jid}] No route received on spawn.")
-                return
-            
-            route = json.loads(response.body)
-            self.agent.route = deque(route[0])
-            self.agent.current_road, self.agent.current_lane = self.agent.route.popleft()
-            self.agent.position = 1
-            self.agent.current_tl_jid = f"tl{self.agent.current_road}@localhost"
-            self.agent.canStillMoveTo = 1
+            car = self.agent
 
-            # Notify TL that car spawned in lane
-            msg = Message(to=self.agent.current_tl_jid)
-            msg.set_metadata("type", "update_laneCapacitiesOnSpawn")
-            msg.body = str(self.agent.current_lane)
+            await self.request_lane_capacity()
+            await self.signal_to_update_lane_capacity()
+
+            car.add_behaviour(car.DriveController(period=0.2))
+
+        async def send_message(self, to: str, performative: str, onthology: str, action: str, body: str):
+            car = self.agent
+
+            msg = Message(to=to, metadata={"performative": performative, "onthology": onthology, "action": action}, body=body)
             await self.send(msg)
-            #print(f"[{self.agent.jid}] Spawned at road {self.agent.current_road}, lane {self.agent.current_lane}")
+            #print(f"[{car.jid}] → Sent to {to}: ({performative}, {action}) {body}")
+
+        async def request_lane_capacity(self):
+            car = self.agent
+
+            message = json.dumps({"road": car.current_road, "lane": car.current_lane})
+            await self.send_message(to=car.current_tl_jid, performative="request", onthology="traffic-management", action="get-lane-capacity", body=message)
+
+            while (car.current_road, car.current_lane) not in car.received_capacities:
+                await asyncio.sleep(0.01)
+            
+            car.current_lane_capacity = car.received_capacities[(car.current_road, car.current_lane)][0]
+            car.total_lane_capacity = car.received_capacities[(car.current_road, car.current_lane)][1]
+            car.can_still_move_to = car.total_lane_capacity - car.current_lane_capacity
+
+            car.received_capacities = {}
+            car.n_received_capacities = 0
+
+        async def signal_to_update_lane_capacity(self):
+            car = self.agent
+
+            message = json.dumps({"car": str(car.jid), "lane": car.current_lane, "event": "+"})
+            await self.send_message(to=car.current_tl_jid, performative="inform", onthology="traffic-management", action="update-lane", body=message)
 
     class DriveController(PeriodicBehaviour):
-        """Main driving logic — handles movement, communication, and rerouting."""
+        """Main driving logic"""
         async def run(self):
-            # 1. Update traffic light signal and lane capacity
-            await self.update_signal_and_capacity()
-            if self.agent.current_tl_signal is None:
-                return  # no info yet, skip tick
+            car = self.agent
 
-            # 2. Move the car based on the current signal and capacity
-            await self.move_once()
-
-        async def update_signal_and_capacity(self):
-            msg = Message(to=self.agent.current_tl_jid)
-            msg.set_metadata("type", "request_signalAndCapacity")
-            msg.body = str(self.agent.current_lane)
-            await self.send(msg)
-
-            response = await self.receive(timeout=1)
-            if response:
-                self.agent.current_tl_signal, self.agent.current_lane_capacity, self.agent.total_lane_capacity = map(int, response.body.split())
-                # Debug print
-                # print(f"[{self.agent.jid}] Signal={self.agent.current_tl_signal}, Cap={self.agent.current_lane_capacity}/{self.agent.total_lane_capacity}")
-
-        async def move_once(self):
-            # Red light
-            if self.agent.current_tl_signal == 0:
-                if self.agent.position + 1 <= self.agent.total_lane_capacity and self.agent.position + 1 <= self.agent.canStillMoveTo:
-                    self.agent.position += 1
-
-            # Green light
-            elif self.agent.current_tl_signal == 1:
-                if self.agent.position + 1 <= self.agent.total_lane_capacity:
-                    self.agent.position += 1
-                    self.agent.canStillMoveTo += 1
-                else:
-                    await self.try_change_road()
-
-        async def try_change_road(self):
-            """Try to move to the next road, or reroute if blocked."""
-            if not self.agent.route:
-                print(f"[{self.agent.jid}] No route left — destination reached?")
+            if car.position < car.can_still_move_to:
+                car.position += 1
                 return
 
-            self.agent.next_road, self.agent.next_lane = self.agent.route[0]
+            elif car.position == car.total_lane_capacity:
+                await self.request_signal()
 
-            # Ask next TL for capacity
-            msg = Message(to=self.agent.current_tl_jid)
-            msg.set_metadata("type", "request_nextLaneCapacity")
-            msg.body = f"{self.agent.next_road} {self.agent.next_lane}"
-            await self.send(msg)
+                if car.current_tl_signal == "green":
+                    await self.request_new_routes()
+                    await self.request_capacities()
+                    entering_road, entering_lane = self.choose_route()
 
-            reply = await self.receive(timeout=2)
-            if not reply:
-                print(f"[{self.agent.jid}] No next lane capacity info.")
-                return
+                    if entering_road != None and entering_lane != None:
+                        leaving_road, leaving_lane = car.current_road, car.current_lane
+                        await self.update_car_attributes(entering_road, entering_lane)
+                        await self.signal_to_update_lane_capacities(leaving_road, entering_road, leaving_lane, entering_lane)
+                        car.current_tl_signal = None
+                        car.possible_routes = None
+                        car.n_received_capacities = 0
+                        car.received_capacities = {}
+                        return
+                    else:
+                        return
 
-            nextLaneCapacity, nextLaneTotalCapacity = map(int, reply.body.split())
-
-            if nextLaneCapacity < nextLaneTotalCapacity:
-                await self.change_road(nextLaneCapacity, nextLaneTotalCapacity)
-            else:
-                found_new_route = await self.find_new_route()
-                if found_new_route:
-                    nextLaneCapacity, nextLaneTotalCapacity = found_new_route
-                    self.change_road(nextLaneCapacity, nextLaneTotalCapacity)
-                else:
+                elif car.current_tl_signal == "red":
+                    await self.send_message(to=car.current_tl_jid, performative="inform", onthology="traffic-management", action="car-waiting", body="")
+                    car.current_tl_signal = None
                     return
 
-        async def change_road(self, nextLaneCapacity, nextLaneTotalCapacity):
-            """Perform the road change when space is available."""
-            self.agent.position = 1
-            self.agent.canStillMoveTo = nextLaneTotalCapacity - nextLaneCapacity
-            self.agent.next_road, self.agent.next_lane = self.agent.route[0]
-
-            # Notify TLs to update lane capacities
-            msg = Message(to=self.agent.current_tl_jid)
-            msg.set_metadata("type", "update_laneCapacitiesAfterChaningRoads_fromCar")
-            msg.body = f"{self.agent.current_lane} {self.agent.next_road} {self.agent.next_lane}"
-            await self.send(msg)
-
-            self.agent.current_road, self.agent.current_lane = self.agent.route.popleft()
-            self.agent.current_tl_jid = f"tl{self.agent.current_road}@localhost"
-
-        async def find_new_route(self):
-            """
-            Ask routing agent for a new possible route.
-            Returns: nextLaneCapacity and nextLaneTotalCapacity 
-            """
-            msg = Message(to=self.agent.routing_agent_JID)
-            msg.set_metadata("type", "request_newRoute")
-            msg.body = f"{self.agent.current_road} {self.agent.current_lane} {self.agent.end_node}"
-            await self.send(msg)
-
-            response = await self.receive(timeout=3)
-            if not response:
-                #print(f"[{self.agent.jid}] No reroute info received.")
+            elif car.position == car.can_still_move_to and car.position >= car.total_lane_capacity - 10:
+                await self.request_signal()
+                if car.current_tl_signal == "red":
+                    await self.send_message(to=car.current_tl_jid, performative="inform", onthology="traffic-management", action="car-waiting", body="")
+                    car.current_tl_signal = None
                 return
 
-            routes_list = json.loads(response.body)
-            possibleRoutes = [(deque(route[0]), route[1]) for route in routes_list]
-            possibleRoutes = sorted(possibleRoutes, key=lambda x: (x[1] if x[1] is not None else float("+inf")))
+        async def send_message(self, to: str, performative: str, onthology: str, action: str, body: str):
+            car = self.agent
 
-            for route, _ in possibleRoutes:
-                self.agent.next_road, self.agent.next_lane = route[0]
-                next_cap = await self.request_next_lane_capacity()
-                if next_cap and next_cap[0] < next_cap[1]:
-                    self.agent.route = route
-                    #print(f"[{self.agent.jid}] Found new route via road {self.agent.next_road}, lane {self.agent.next_lane}")
-                    return next_cap
-            return None
-
-        async def request_next_lane_capacity(self):
-            """Helper to query next lane capacity."""
-            msg = Message(to=self.agent.current_tl_jid)
-            msg.set_metadata("type", "request_nextLaneCapacity")
-            msg.body = f"{self.agent.next_road} {self.agent.next_lane}"
+            msg = Message(to=to, metadata={"performative": performative, "onthology": onthology, "action": action}, body=body)
             await self.send(msg)
+            #print(f"[{car.jid}] → Sent to {to}: ({performative}, {action}) {body}")
 
-            reply = await self.receive(timeout=1)
-            if reply:
-                return tuple(map(int, reply.body.split()))
-            return None
+        async def request_signal(self):
+            car = self.agent
+
+            # Request traffic light for current signal
+            await self.send_message(to=car.current_tl_jid, performative="request", onthology="traffic-management", action="get-signal", body="")
+
+            # Wait for message to arrive
+            while car.current_tl_signal == None:
+                await asyncio.sleep(0.01)
+
+        async def request_new_routes(self):
+            car = self.agent
+
+            # Request routing agent for possible routes to destination
+            message = json.dumps({"current_road": car.current_road, "current_lane": car.current_lane, "end_node": car.end_node})
+            await self.send_message(to=car.current_tl_jid, performative="request", onthology="traffic-management", action="get-routes", body=message)
+
+            # Wait for possible routes to arrive
+            while car.possible_routes == None:
+                await asyncio.sleep(0.01)
+
+        async def request_capacities(self):
+            car = self.agent
+
+            next_road_lanes = set()
+            for route in car.possible_routes:
+                path = route[0]
+                cost = route[1]
+                for road_lane in path:
+                    if road_lane not in next_road_lanes:
+                        next_road_lanes.add(road_lane)
+
+            length_next_road_lanes = len(next_road_lanes)
+
+            for next_road_lane in next_road_lanes:
+                road = next_road_lane[0]
+                lane = next_road_lane[1]
+                send_to = f"tl{road}@localhost"
+                message = json.dumps({"road": road, "lane": lane})
+                await self.send_message(to=send_to, performative="request", onthology="traffic-management", action="get-lane-capacity", body=message)
+
+            while car.n_received_capacities != length_next_road_lanes:
+                await asyncio.sleep(0.01)
+
+        def choose_route(self):
+            car = self.agent
+
+            for route in car.possible_routes:
+                temp_capacity = 0
+                path = route[0]
+                for road_lane in path:
+                    temp_capacity += car.received_capacities[road_lane][0]
+                route.append(temp_capacity)
+
+            for route in car.possible_routes:
+                travel_cost = route[1]
+                capacity_cost = route[2]
+                total_cost = (car.travel_weight*travel_cost) + (car.capacity_weight*capacity_cost)
+                route.append(total_cost)
+
+            car.possible_routes.sort(key=lambda route: route[3])
+
+            for route in car.possible_routes:
+                path = route[0]
+                first_road_lane = path[0]
+                first_lane_current_capacity =  car.received_capacities[first_road_lane][0]
+                first_lane_total_capacity =  car.received_capacities[first_road_lane][1]
+                if first_lane_current_capacity < first_lane_total_capacity:
+                    return first_road_lane
+
+            return (None, None)
+
+        async def update_car_attributes(self, entering_road, entering_lane):
+            car = self.agent
+
+            car.current_road, car.current_lane = entering_road, entering_lane
+            car.current_tl_jid = f"tl{car.current_road}@localhost"
+            car.position = 1
+            currentCapacity, totalCapacity = car.received_capacities[(car.current_road, car.current_lane)]
+            car.current_lane_capacity, car.total_lane_capacity = currentCapacity, totalCapacity
+            car.can_still_move_to = car.total_lane_capacity - car.current_lane_capacity
+
+        async def signal_to_update_lane_capacities(self, leaving_road, entering_road, leaving_lane, entering_lane):
+            car = self.agent
+
+            # Request traffic light to update lane capacities for the current road and previous road
+            previous_road_tl_jid = f"tl{leaving_road}@localhost"
+            message = json.dumps({"car": str(car.jid), "lane": leaving_lane, "event": "-"})
+            await self.send_message(to=previous_road_tl_jid, performative="inform", onthology="traffic-management", action="update-lane", body=message)
+
+            next_road_tl_jid = f"tl{entering_road}@localhost"
+            message = json.dumps({"car": str(car.jid), "lane": entering_lane, "event": "+"})
+            await self.send_message(to=next_road_tl_jid, performative="inform", onthology="traffic-management", action="update-lane", body=message)
+       
+    class ReceiveMessageBehaviour(CyclicBehaviour):
+        async def run(self):
+            car = self.agent
+            msg = await self.receive(timeout=5)
+
+            if not msg:
+                return
+
+            performative = msg.metadata.get("performative")
+            onthology = msg.metadata.get("onthology")
+            action = msg.metadata.get("action")
+            sender = str(msg.sender)
+
+            if performative == "inform" and onthology == "traffic-management" and action == "lane-cleared":
+                car.can_still_move_to = min(car.total_lane_capacity, car.can_still_move_to + 1)
+
+            elif performative == "inform" and onthology == "traffic-management" and action == "send-lane-capacity":
+                data = json.loads(msg.body)
+                road = data["road"]
+                lane = data["lane"]
+                current_capacity = data["current_capacity"]
+                total_capacity = data["total_capacity"]
+                car.received_capacities[(road,lane)] = (current_capacity, total_capacity)
+                car.n_received_capacities += 1
+
+            elif performative == "inform" and onthology == "traffic-management" and action == "send-signal":
+                signal = msg.body
+                car.current_tl_signal = signal
+
+            elif performative == "inform" and onthology == "traffic-management" and action == "send-routes":
+                routes = json.loads(msg.body)
+
+                for route in routes:
+                    route[0] = deque(tuple(x) for x in route[0])
+                    route = tuple(route)
+
+                car.possible_routes = routes
+
+            elif performative == "inform" and onthology == "traffic-management" and action == "reached-destination":
+                print(f"[{car.jid}] has reached it's destination")
+
+                message = json.dumps({"car": str(car.jid), "lane": car.current_lane, "event": "-"})
+                await self.send_message(to=car.current_tl_jid, performative="inform", onthology="traffic-management", action="update-lane", body=message)
+
+                if car.remove_callback:
+                    car.remove_callback()
+
+                await car.stop()
