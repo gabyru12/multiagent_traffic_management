@@ -116,18 +116,19 @@ class TrafficLightAgent(Agent):
 
         return path, path_cost
 
-    def generate_routes(self, start_road_ID, start_lane_UID, end_node_ID, K):
+    def generate_routes(self, start_road_ID, start_lane_ID, end_node_ID, K):
         """
         Computes the K shortest loopless paths using Yen’s algorithm.
-        Uses self.dijkstra() which returns (path, cost).
+        Uses self.generate_route() which returns (path, cost).
         Each path is a deque of (roadID, laneID).
         """
+
+        start_lane_UID = self.network.roads[start_road_ID].lanes[start_lane_ID].UID
 
         # ---- First shortest path (Dijkstra) ----
         first_path, first_cost = self.dijkstra(start_road_ID, start_lane_UID, end_node_ID)
         if not first_path:
             return []   # no path exists
-
         A = [(first_path, first_cost)]   # shortest paths found
         B = []                           # candidate paths: (cost, path)
 
@@ -151,15 +152,15 @@ class TrafficLightAgent(Agent):
                     spur_road_ID, spur_lane_UID = root_path[-1]
 
                 # ---- Temporarily remove roads that recreate previously found paths ----
-                removed_roads = []
+                removed_roads = {}  
                 for p, _ in A:
                     p_list = list(p)
                     if len(p_list) > i and p_list[:i] == root_path:
                         banned_road_ID, banned_lane_UID = p_list[i]
                         lane = self.network.lanes[banned_lane_UID]
-                        original_outflow = lane.outFlowLanes
-                        lane.outFlowLanes = []
-                        removed_roads.append((lane, original_outflow))
+                        if lane not in removed_roads:             
+                            removed_roads[lane] = lane.outFlowLanes
+                        lane.outFlowLanes = []       
 
                 # ---- Compute spur path ----
                 spur_path, spur_cost = self.dijkstra(spur_road_ID, spur_lane_UID, end_node_ID)
@@ -177,7 +178,7 @@ class TrafficLightAgent(Agent):
                     heapq.heappush(B, (new_full_cost, new_full_path))
 
                 # ---- Restore removed outflows ----
-                for lane, original in removed_roads:
+                for lane, original in removed_roads.items():
                     lane.outFlowLanes = original
 
             # ---- No more candidates ----
@@ -188,14 +189,15 @@ class TrafficLightAgent(Agent):
             cost, path = heapq.heappop(B)
             A.append((path, cost))
 
+
         for j in range(len(A)):
             A[j] = list(A[j])
             for i in range(len(A[j][0])):
                 A[j][0][i] = list(A[j][0][i])
                 A[j][0][i][1] = self.network.lanes[A[j][0][i][1]].ID
                 A[j][0][i] = tuple(A[j][0][i])
+            A[j][0].popleft()
             A[j] = tuple(A[j])
-
         return A
 
     async def setup(self):
@@ -261,7 +263,6 @@ class TrafficLightAgent(Agent):
                 tl.received_proposals[sender] = proposal_data
 
             elif performative == "accept-proposal" and onthology == "traffic-management" and action == "accept-proposal":
-                #print(f"[{tl.jid}] has accepted to turn it's light green")
                 tl.add_behaviour(tl.SignalTimeBehaviour())
 
             elif performative == "reject-proposal" and onthology == "traffic-management" and action == "reject-proposal":
@@ -273,6 +274,12 @@ class TrafficLightAgent(Agent):
             elif performative == "request" and onthology == "traffic-management" and action == "get-routes":
                 data = json.loads(msg.body)
                 road_id, lane_id, end_node_id = data["current_road"], data["current_lane"], data["end_node"]
+
+                if tl.network.roads[data["current_road"]].endNode.ID == data["end_node"]:
+                    await self.send_message(to=sender, performative="inform", onthology="traffic-management", action="reached-destination", body="You've arrived at your destination")
+                    return
+
+
                 routes = tl.generate_routes(road_id, lane_id, end_node_id, 5)
                 for i in range(len(routes)):
                     routes[i] = list(routes[i])
@@ -287,7 +294,7 @@ class TrafficLightAgent(Agent):
 
             msg = Message(to=to, metadata={"performative": performative, "onthology": onthology, "action": action}, body=body)
             await self.send(msg)
-
+            
             #print(f"[{tl.jid}] → Sent to {to}: ({performative}, {action}) {body}")
 
         async def inform_car_has_left(self, affected_lane):
@@ -301,7 +308,6 @@ class TrafficLightAgent(Agent):
             tl = self.agent
 
             # Turn light to green
-            #print(f"[{tl.jid}] is turning green.")
             green_light_time = self.set_green_light_time()
             tl.signal = "green"
             await asyncio.sleep(green_light_time)
@@ -319,7 +325,6 @@ class TrafficLightAgent(Agent):
                 best_proposal = self.choose_best_proposal()
 
             # Turn light to red
-            #print(f"[{tl.jid}] is turning red.")
             tl.signal = "red"
 
             for neighbouring_tl in tl.TL_group:
