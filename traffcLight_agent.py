@@ -1,7 +1,12 @@
 from spade.agent import Agent
-from spade.behaviour import CyclicBehaviour
+from spade.behaviour import OneShotBehaviour, CyclicBehaviour
 from spade.template import Template
 from spade.message import Message
+
+from collections import deque
+import json
+import asyncio
+import heapq
 
 
 class TrafficLightAgent(Agent):
@@ -11,197 +16,348 @@ class TrafficLightAgent(Agent):
     and coordinates with neighbouring TLs.
     """
 
-    def __init__(self, jid, password, road_id, intersection, road_capacity, n_lanes):
+    def __init__(self, jid: str, password: str, road_id: int, network: "Network"):
         super().__init__(jid, password)
         self.road_id = road_id
-        self.intersection = intersection
-        self.road_capacity = road_capacity
-        self.n_lanes = n_lanes
-        self.lane_capacities = [0 for _ in range(n_lanes)]  # cars currently in lane
-        self.signal = 0  # 0=red, 1=green (for simplicity)
+        self.network = network
+        self.yellow_light_time = 0.5
+
+        self.intersection = None
+        self.road_capacity = None
+        self.n_lanes = None
+        self.TL_group = []
+
+        # Dynamic attributes
+        self.lane_capacities = None
+        self.cars_in_lane = None
+        self.signal = "red"
+        self.tolerance = 0
+        self.received_proposals = {}
+        self.best_proposal = None
+
+    def init_properties(self):
+        self.intersection = self.network.roads[self.road_id].endNode.ID
+        self.road_capacity = self.network.roads[self.road_id].length
+        self.n_lanes = self.network.roads[self.road_id].laneCount
+
+        self.lane_capacities = {i: 0 for i in range(self.n_lanes)} 
+        self.cars_in_lane = {i: deque() for i in range(self.n_lanes)}
+
+        for road in self.network.nodes[self.intersection].inRoads:
+            if road.ID != self.road_id:
+                tl_responsible = f"tl{road.ID}@localhost"
+                self.TL_group.append(tl_responsible)
+
+    def dijkstra(self, start_road_ID: int, start_lane_UID: int, end_node_ID: int):
+        """
+        Dijkstra shortest-path on lanes.
+        start_road: the road where the car currently is
+        start_lane: the lane the car is currently in
+        end_node: the target node
+        Returns deque of (road, lane)
+        """
+
+        routes = []
+        startRoad = self.network.roads[start_road_ID]
+        startLane = self.network.lanes[start_lane_UID]
+        
+        # Priority queue: (cost, counter, lane)
+        pq = []
+        parent = {}        # lane → previous lane
+        dist = {}          # lane → distance
+        visited = set()
+        counter = 0        # unique increasing ID (tie-breaker)
+
+        # Initialize Dijkstra with the car's current lane
+        dist[startLane] = 0
+        parent[startLane] = None
+        heapq.heappush(pq, (0, counter, startLane))
+        counter += 1
+        goal_lane = None
+        path_cost = None
+
+        # ----- Dijkstra search -----
+        while pq:
+            current_cost, _, lane = heapq.heappop(pq)
+
+            if lane in visited:
+                continue
+            visited.add(lane)
+
+            road = lane.road
+
+            # Goal condition: the lane arrives at the desired node
+            if road.endNode.ID == end_node_ID:
+                goal_lane = lane
+                path_cost = current_cost
+                break
+
+            # Relax neighbors (the lanes you can drive into next)
+            for next_lane in lane.outFlowLanes:
+                new_cost = current_cost + next_lane.length
+
+                if next_lane not in dist or new_cost < dist[next_lane]:
+                    dist[next_lane] = new_cost
+                    parent[next_lane] = lane
+                    heapq.heappush(pq, (new_cost, counter, next_lane))
+                    counter += 1
+
+        # ----- No route found -----
+        if goal_lane is None:
+            return deque(), path_cost
+
+        # ----- Reconstruct the lane-by-lane route -----
+        path = deque()
+        lane = goal_lane
+
+        while lane is not None:
+            path.appendleft((lane.road.ID, lane.UID))
+            lane = parent[lane]
+
+        return path, path_cost
+
+    def generate_routes(self, start_road_ID, start_lane_UID, end_node_ID, K):
+        """
+        Computes the K shortest loopless paths using Yen’s algorithm.
+        Uses self.dijkstra() which returns (path, cost).
+        Each path is a deque of (roadID, laneID).
+        """
+
+        # ---- First shortest path (Dijkstra) ----
+        first_path, first_cost = self.dijkstra(start_road_ID, start_lane_UID, end_node_ID)
+        if not first_path:
+            return []   # no path exists
+
+        A = [(first_path, first_cost)]   # shortest paths found
+        B = []                           # candidate paths: (cost, path)
+
+        # ---- Loop to find paths 2..K ----
+        for k in range(1, K):
+            prev_path, prev_cost = A[k-1]
+
+            prev_path_list = list(prev_path)
+            num_nodes = len(prev_path_list)
+
+            # Spur at every node except the last
+            for i in range(num_nodes - 1):
+
+                # ---- Root path ----
+                root_path = prev_path_list[:i]
+
+                if not root_path:
+                    spur_road_ID  = start_road_ID
+                    spur_lane_UID  = start_lane_UID
+                else:
+                    spur_road_ID, spur_lane_UID = root_path[-1]
+
+                # ---- Temporarily remove roads that recreate previously found paths ----
+                removed_roads = []
+                for p, _ in A:
+                    p_list = list(p)
+                    if len(p_list) > i and p_list[:i] == root_path:
+                        banned_road_ID, banned_lane_UID = p_list[i]
+                        lane = self.network.lanes[banned_lane_UID]
+                        original_outflow = lane.outFlowLanes
+                        lane.outFlowLanes = []
+                        removed_roads.append((lane, original_outflow))
+
+                # ---- Compute spur path ----
+                spur_path, spur_cost = self.dijkstra(spur_road_ID, spur_lane_UID, end_node_ID)
+
+                # ---- If spur path exists, build full path candidate ----
+                if spur_path:
+                    spur_list = list(spur_path)
+                    if spur_list and root_path:
+                        # drop the first lane of the spur, because it repeats root's last lane
+                        spur_list = spur_list[1:]
+
+                    new_full_path = deque(root_path + spur_list)
+                    new_full_cost = sum(self.network.lanes[laneUID].length for _, laneUID in new_full_path) - self.network.roads[new_full_path[0][0]].length
+
+                    heapq.heappush(B, (new_full_cost, new_full_path))
+
+                # ---- Restore removed outflows ----
+                for lane, original in removed_roads:
+                    lane.outFlowLanes = original
+
+            # ---- No more candidates ----
+            if not B:
+                break
+
+            # ---- Choose the shortest remaining candidate ----
+            cost, path = heapq.heappop(B)
+            A.append((path, cost))
+
+        for j in range(len(A)):
+            A[j] = list(A[j])
+            for i in range(len(A[j][0])):
+                A[j][0][i] = list(A[j][0][i])
+                A[j][0][i][1] = self.network.lanes[A[j][0][i][1]].ID
+                A[j][0][i] = tuple(A[j][0][i])
+            A[j] = tuple(A[j])
+
+        return A
 
     async def setup(self):
-        #print(f"[{self.jid}] Traffic light for road {self.road_id} started.")
+        print(f"[{self.jid}] Traffic light for road {self.road_id} started.")
+        self.init_properties()
+        self.add_behaviour(self.ReceiveMessageBehaviour())
 
-        # --- 1. Respond to cars asking about signal & current lane capacity
-        t1 = Template(metadata={"type": "request_signalAndCapacity"})
-        self.add_behaviour(self.SignalResponder(), t1)
-
-        # --- 2. Handle cars requesting the next lane capacity (indirect request)
-        t2 = Template(metadata={"type": "request_nextLaneCapacity"})
-        self.add_behaviour(self.NextLaneCapacityRedirector(), t2)
-
-        # --- 3. Respond to redirected requests from another TL
-        t3 = Template(metadata={"type": "redirectedRequest_nextLaneCapacity"})
-        self.add_behaviour(self.NextLaneCapacityResponder(), t3)
-
-        # --- 4. Pass info back to the car via the original TL
-        t4 = Template(metadata={"type": "info_nextLaneCapacity"})
-        self.add_behaviour(self.NextLaneInfoBackToCar(), t4)
-
-        # --- 5. Update lane capacity when a car spawns
-        t5 = Template(metadata={"type": "update_laneCapacitiesOnSpawn"})
-        self.add_behaviour(self.UpdateLaneCapacitiesOnCarSpawn(), t5)
-
-        # --- 6. Handle capacity updates when cars change roads
-        t6 = Template(metadata={"type": "update_laneCapacitiesAfterChaningRoads_fromCar"})
-        self.add_behaviour(self.UpdateLaneCapacitiesSignalFromCar(), t6)
-
-        t7 = Template(metadata={"type": "update_laneCapacitiesAfterChaningRoads_fromTL"})
-        self.add_behaviour(self.UpdateLaneCapacitiesSignalFromTL(), t7)
-
-    # ---------------------------------------------------------------
-    # Behaviour 1: Respond to car asking about signal & lane capacity
-    # ---------------------------------------------------------------
-    class SignalResponder(CyclicBehaviour):
-        """Send current signal and lane capacity back to the requesting car."""
+    # -------------
+    # Behaviours 
+    # -------------
+    class ReceiveMessageBehaviour(CyclicBehaviour):
         async def run(self):
-            msg = await self.receive(timeout=1)
+            tl = self.agent
+            msg = await self.receive(timeout=5)
+
             if not msg:
                 return
 
-            try:
-                lane = int(msg.body)
-            except ValueError:
+            performative = msg.metadata.get("performative")
+            onthology = msg.metadata.get("onthology")
+            action = msg.metadata.get("action")
+            sender = str(msg.sender)
+
+            if performative == "request" and onthology == "traffic-management" and action == "get-signal":
+                message = tl.signal
+                await self.send_message(to=sender, performative="inform", onthology="traffic-management", action="send-signal", body=message)
+                
+            elif performative == "request" and onthology == "traffic-management" and action == "get-lane-capacity":
+                data = json.loads(msg.body)
+                road = data["road"]
+                lane = data["lane"]
+                current_capacity = tl.lane_capacities[lane]
+                total_capacity = tl.road_capacity
+
+                message = json.dumps({"road": data["road"], "lane": data["lane"], "current_capacity": current_capacity, "total_capacity": total_capacity})
+                await self.send_message(to=sender, performative="inform", onthology="traffic-management", action="send-lane-capacity", body=message)
+
+            elif performative == "inform" and onthology == "traffic-management" and action == "update-lane":
+                data = json.loads(msg.body)
+                car = data["car"]
+                affected_lane = data["lane"]
+                event = data["event"]
+
+                if event == "+":
+                    tl.lane_capacities[affected_lane] += 1
+                    tl.cars_in_lane[affected_lane].append(car)
+                
+                elif event == "-":
+                    tl.lane_capacities[affected_lane] -= 1
+                    tl.cars_in_lane[affected_lane].popleft()
+                    await self.inform_car_has_left(affected_lane)
+
+            elif performative == "cfp" and onthology == "traffic-management" and action == "asking-for-proposal":
+                n_cars_in_road = 0
+                for lane, n_cars_in_lane in tl.lane_capacities.items():
+                    n_cars_in_road += n_cars_in_lane 
+
+                message = json.dumps({"tolerance": tl.tolerance, "n_cars_in_road": n_cars_in_road})
+                await self.send_message(to=sender, performative="propose", onthology="traffic-management", action="send-proposal", body=message)
+
+            elif performative == "propose" and onthology == "traffic-management" and action == "send-proposal":
+                proposal_data = json.loads(msg.body)
+                tl.received_proposals[sender] = proposal_data
+
+            elif performative == "accept-proposal" and onthology == "traffic-management" and action == "accept-proposal":
+                #print(f"[{tl.jid}] has accepted to turn it's light green")
+                tl.add_behaviour(tl.SignalTimeBehaviour())
+
+            elif performative == "reject-proposal" and onthology == "traffic-management" and action == "reject-proposal":
                 return
 
-            if lane < 0 or lane >= self.agent.n_lanes:
-                #print(f"[{self.agent.jid}] Invalid lane ID {lane}")
-                return
+            elif performative == "inform" and onthology == "traffic-management" and action == "car-waiting":
+                tl.tolerance += 1
 
-            reply = msg.make_reply()
-            reply.set_metadata("type", "info_signalCapacity")
-            reply.body = f"{self.agent.signal} {self.agent.lane_capacities[lane]} {self.agent.road_capacity}"
-            await self.send(reply)
+            elif performative == "request" and onthology == "traffic-management" and action == "get-routes":
+                data = json.loads(msg.body)
+                road_id, lane_id, end_node_id = data["current_road"], data["current_lane"], data["end_node"]
+                routes = tl.generate_routes(road_id, lane_id, end_node_id, 5)
+                for i in range(len(routes)):
+                    routes[i] = list(routes[i])
+                    routes[i][0] = list(routes[i][0])
+                    routes[i] = tuple(routes[i])
 
-    # ---------------------------------------------------------------
-    # Behaviour 2: Redirect car's next-lane request to next TL
-    # ---------------------------------------------------------------
-    class NextLaneCapacityRedirector(CyclicBehaviour):
-        """Receive car's request and forward it to the TL of the next road."""
+                message = json.dumps(routes)
+                await self.send_message(to=sender, performative="inform", onthology="traffic-management", action="send-routes", body=message)
+
+        async def send_message(self, to, performative, onthology, action, body):
+            tl = self.agent 
+
+            msg = Message(to=to, metadata={"performative": performative, "onthology": onthology, "action": action}, body=body)
+            await self.send(msg)
+
+            #print(f"[{tl.jid}] → Sent to {to}: ({performative}, {action}) {body}")
+
+        async def inform_car_has_left(self, affected_lane):
+            tl = self.agent
+
+            for car in tl.cars_in_lane[affected_lane]:
+                await self.send_message(to=car, performative="inform", onthology="traffic-management", action="lane-cleared", body="")
+
+    class SignalTimeBehaviour(OneShotBehaviour):
         async def run(self):
-            msg = await self.receive(timeout=1)
-            if not msg:
-                return
+            tl = self.agent
 
-            try:
-                next_edge, next_lane = msg.body.split()
-            except ValueError:
-                return
+            # Turn light to green
+            #print(f"[{tl.jid}] is turning green.")
+            green_light_time = self.set_green_light_time()
+            tl.signal = "green"
+            await asyncio.sleep(green_light_time)
 
-            carJID = str(msg.sender)
-            next_tl_jid = f"tl{next_edge}@localhost"
+            for neighbouring_tl in tl.TL_group:
+                await self.send_message(to=neighbouring_tl, performative="cfp", onthology="traffic-management", action="asking-for-proposal", body="")
 
-            redirect_msg = Message(to=next_tl_jid)
-            redirect_msg.set_metadata("type", "redirectedRequest_nextLaneCapacity")
-            redirect_msg.body = f"{next_lane} {carJID}"
-            await self.send(redirect_msg)
+            # Turn light to yellow
+            tl.signal = "yellow"
+            await asyncio.sleep(tl.yellow_light_time)
 
-    # ---------------------------------------------------------------
-    # Behaviour 3: Respond to redirected request from another TL
-    # ---------------------------------------------------------------
-    class NextLaneCapacityResponder(CyclicBehaviour):
-        """Respond to TL asking for a lane’s current and total capacity."""
-        async def run(self):
-            msg = await self.receive(timeout=1)
-            if not msg:
-                return
+            best_proposal = None
 
-            try:
-                lane, carJID = msg.body.split()
-                lane = int(lane)
-            except ValueError:
-                return
+            if len(tl.received_proposals) > 0:
+                best_proposal = self.choose_best_proposal()
 
-            if lane < 0 or lane >= self.agent.n_lanes:
-                return
+            # Turn light to red
+            #print(f"[{tl.jid}] is turning red.")
+            tl.signal = "red"
 
-            reply = msg.make_reply()
-            reply.set_metadata("type", "info_nextLaneCapacity")
-            reply.body = f"{self.agent.lane_capacities[lane]} {self.agent.road_capacity} {carJID}"
-            await self.send(reply)
+            for neighbouring_tl in tl.TL_group:
+                if neighbouring_tl == best_proposal[0]:
+                    winner = best_proposal[0]
+                    await self.send_message(to=neighbouring_tl, performative="accept-proposal", onthology="traffic-management", action="accept-proposal", body="")
+            
+                else:
+                    await self.send_message(to=neighbouring_tl, performative="reject-proposal", onthology="traffic-management", action="reject-proposal", body="")
+            
+            tl.received_proposals = {}
+            tl.best_proposal = None
+            tl.tolerance = 0
 
-    # ---------------------------------------------------------------
-    # Behaviour 4: Pass next-lane info back to the car
-    # ---------------------------------------------------------------
-    class NextLaneInfoBackToCar(CyclicBehaviour):
-        """Forward next-lane capacity info to the requesting car."""
-        async def run(self):
-            msg = await self.receive(timeout=1)
-            if not msg:
-                return
+        async def send_message(self, to, performative, onthology, action, body):
+            tl = self.agent
 
-            try:
-                nextLaneCapacity, nextLaneTotalCapacity, carJID = msg.body.split()
-            except ValueError:
-                return
+            msg = Message(to=to, metadata={"performative": performative, "onthology": onthology, "action": action}, body=body)
+            await self.send(msg)
 
-            msgToCar = Message(to=carJID)
-            msgToCar.set_metadata("type", "info_nextLaneCapacity")
-            msgToCar.body = f"{nextLaneCapacity} {nextLaneTotalCapacity}"
-            await self.send(msgToCar)
+            #print(f"[{tl.jid}] → Sent to {to}: ({performative}, {action}) {body}")
 
-    # ---------------------------------------------------------------
-    # Behaviour 5: Increment lane capacity when a car spawns
-    # ---------------------------------------------------------------
-    class UpdateLaneCapacitiesOnCarSpawn(CyclicBehaviour):
-        async def run(self):
-            msg = await self.receive(timeout=1)
-            if not msg:
-                return
+        def set_green_light_time(self):
+            tl = self.agent
 
-            try:
-                laneToUpdate = int(msg.body)
-            except ValueError:
-                return
+            minimum_time = 1
+            maximum_time = 2
+            green_light_time = round(minimum_time + (maximum_time - minimum_time) * (sum(tl.lane_capacities.values())/(tl.n_lanes * tl.road_capacity)), 1)
 
-            if 0 <= laneToUpdate < self.agent.n_lanes:
-                self.agent.lane_capacities[laneToUpdate] += 1
-                # print(f"[{self.agent.jid}] Car spawned: lane {laneToUpdate} now has {self.agent.lane_capacities[laneToUpdate]} cars")
+            return green_light_time
 
-    # ---------------------------------------------------------------
-    # Behaviour 6: Update capacity when car leaves to another road
-    # ---------------------------------------------------------------
-    class UpdateLaneCapacitiesSignalFromCar(CyclicBehaviour):
-        """Decrease current lane and notify next TL to increase its lane."""
-        async def run(self):
-            msg = await self.receive(timeout=1)
-            if not msg:
-                return
+        def choose_best_proposal(self):
+            tl = self.agent
+            
+            # Sorts senders by the tolerance score in their proposal in descending order
+            sorted_proposals = sorted(tl.received_proposals.items(), key=lambda item: item[1]["tolerance"], reverse=True)
+            best_proposal = sorted_proposals[0]
 
-            try:
-                laneFrom, nextRoad, nextLane = msg.body.split()
-                laneFrom = int(laneFrom)
-                nextLane = int(nextLane)
-            except ValueError:
-                return
+            return best_proposal
 
-            # Car left: free one spot in this TL’s lane
-            if 0 <= laneFrom < self.agent.n_lanes:
-                self.agent.lane_capacities[laneFrom] = max(0, self.agent.lane_capacities[laneFrom] - 1)
 
-            # Notify next TL
-            next_tl_jid = f"tl{nextRoad}@localhost"
-            msgToNext = Message(to=next_tl_jid)
-            msgToNext.set_metadata("type", "update_laneCapacitiesAfterChaningRoads_fromTL")
-            msgToNext.body = str(nextLane)
-            await self.send(msgToNext)
-
-    # ---------------------------------------------------------------
-    # Behaviour 7: Update capacity when notified by previous TL
-    # ---------------------------------------------------------------
-    class UpdateLaneCapacitiesSignalFromTL(CyclicBehaviour):
-        """Increase lane capacity when another TL tells us a car arrived."""
-        async def run(self):
-            msg = await self.receive(timeout=1)
-            if not msg:
-                return
-
-            try:
-                laneToUpdate = int(msg.body)
-            except ValueError:
-                return
-
-            if 0 <= laneToUpdate < self.agent.n_lanes:
-                self.agent.lane_capacities[laneToUpdate] += 1
-                # print(f"[{self.agent.jid}] Car arrived: lane {laneToUpdate} now has {self.agent.lane_capacities[laneToUpdate]} cars")
