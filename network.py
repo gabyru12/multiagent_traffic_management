@@ -263,12 +263,14 @@ class Network:
 
         return path, path_cost
 
-    def yen_k_shortest_paths(self, start_road_ID, start_lane_UID, end_node_ID, K):
+    def yen_k_shortest_paths(self, start_road_ID, start_lane_ID, end_node_ID, K):
         """
         Computes the K shortest loopless paths using Yen’s algorithm.
         Uses self.generate_route() which returns (path, cost).
         Each path is a deque of (roadID, laneID).
         """
+
+        start_lane_UID = self.roads[start_road_ID].lanes[start_lane_ID].UID
 
         # ---- First shortest path (Dijkstra) ----
         first_path, first_cost = self.generate_route(start_road_ID, start_lane_UID, end_node_ID)
@@ -297,15 +299,15 @@ class Network:
                     spur_road_ID, spur_lane_UID = root_path[-1]
 
                 # ---- Temporarily remove roads that recreate previously found paths ----
-                removed_roads = []
+                removed_roads = {}  
                 for p, _ in A:
                     p_list = list(p)
                     if len(p_list) > i and p_list[:i] == root_path:
                         banned_road_ID, banned_lane_UID = p_list[i]
                         lane = self.lanes[banned_lane_UID]
-                        original_outflow = lane.outFlowLanes
-                        lane.outFlowLanes = []
-                        removed_roads.append((lane, original_outflow))
+                        if lane not in removed_roads:             
+                            removed_roads[lane] = lane.outFlowLanes
+                        lane.outFlowLanes = []       
 
                 # ---- Compute spur path ----
                 spur_path, spur_cost = self.generate_route(spur_road_ID, spur_lane_UID, end_node_ID)
@@ -323,7 +325,7 @@ class Network:
                     heapq.heappush(B, (new_full_cost, new_full_path))
 
                 # ---- Restore removed outflows ----
-                for lane, original in removed_roads:
+                for lane, original in removed_roads.items():
                     lane.outFlowLanes = original
 
             # ---- No more candidates ----
@@ -333,7 +335,6 @@ class Network:
             # ---- Choose the shortest remaining candidate ----
             cost, path = heapq.heappop(B)
             A.append((path, cost))
-
 
         for j in range(len(A)):
             A[j] = list(A[j])
@@ -407,19 +408,3 @@ class Lane:
             laneID = self.road.lanes[i].ID
             if laneID != self.ID:
                 self.parallelLanes.append(self.road.lanes[i])
-        
-# network = Network()
-    
-# network.create_network()
-
-# for i in range(1):
-#     start_node = random.choice(network.spawn_nodes)
-#     temp = [i+1 for i in range(len(network.nodes))]
-#     temp.remove(start_node.ID)
-#     end_node = network.nodes[random.choice(temp)]
-#     road_id = start_node.outRoads[0].ID
-#     lane_uid = network.roads[road_id].lanes[0].UID
-#     end_node_id = end_node.ID
-#     routes = network.yen_k_shortest_paths(road_id, lane_uid, end_node_id, 10)
-#     for route in routes:
-#         print(route)
